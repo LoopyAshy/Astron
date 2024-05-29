@@ -37,6 +37,7 @@ static BooleanValueConstraint anonymous_is_boolean(uberdog_anon);
 static void printHelp(ostream &s);
 static void printCompiledOptions(ostream &s);
 
+#ifndef STATIC_LIB
 int main(int argc, char *argv[])
 {
     string cfg_file;
@@ -277,6 +278,220 @@ int main(int argc, char *argv[])
 
     return exit_code;
 }
+#endif // !STATIC_LIB
+
+#ifdef STATIC_LIB
+extern "C" int run_astrond(const char* cfgFile, bool prettyPrint, bool logging, const char* logLevel, bool console_logging)
+{
+#ifdef __linux__
+    // This is a bit of a kludge, but it's necessary:
+    // We need to make sure that we don't exceed the default TLS threshold with stdlibs such as musl.
+    pthread_attr_t attr;
+
+    if (pthread_attr_init(&attr))
+        return 1;
+
+    // 2 << 20 is the glibc default (page aligned).
+    if (pthread_attr_setstacksize(&attr, 2 << 20))
+        return 1;
+
+    if (pthread_setattr_default_np(&attr))
+        return 1;
+
+    // We need to ignore SIGPIPE issues ourselves for Linux (libuv issue #1254)
+    signal(SIGPIPE, SIG_IGN);
+#endif
+    LogSeverity sev = g_logger->get_min_severity();
+    if (!logging && !console_logging) {
+        g_logger.reset(new Logger("", sev, console_logging));
+    }
+    else if (logging) {
+		g_logger.reset(new Logger("astrond.log", sev, console_logging));
+	}
+    if (logLevel != NULL) {
+        if (strcmp(logLevel, "packet")) {
+			sev = LSEVERITY_PACKET;
+			g_logger->set_min_severity(sev);
+		}
+		else if (strcmp(logLevel, "trace")) {
+			sev = LSEVERITY_TRACE;
+			g_logger->set_min_severity(sev);
+		}
+		else if (strcmp(logLevel, "debug")) {
+			sev = LSEVERITY_DEBUG;
+			g_logger->set_min_severity(sev);
+		}
+		else if (strcmp(logLevel, "info")) {
+			sev = LSEVERITY_INFO;
+			g_logger->set_min_severity(sev);
+		}
+		else if (strcmp(logLevel, "warning")) {
+			sev = LSEVERITY_INFO;
+			g_logger->set_min_severity(sev);
+		}
+		else if (strcmp(logLevel, "security")) {
+			sev = LSEVERITY_SECURITY;
+			g_logger->set_min_severity(sev);
+		}
+        else if (strcmp(logLevel, "error") && strcmp(logLevel, "fatal")) {
+            cerr << "Unknown log-level \"" << logLevel << "\"." << endl;
+            printHelp(cerr);
+            return 1;
+        }
+    }
+
+    g_loop = uvw::Loop::getDefault();
+    g_main_thread_id = std::this_thread::get_id();
+
+    g_logger->set_color_enabled(prettyPrint);
+
+    std::string cfg_file;
+    if (cfgFile == NULL) {
+        cfg_file = "astrond.yml";
+    }
+    else {
+        cfg_file = std::string(cfgFile);
+
+        // seperate path
+        string filename = fs::filename(cfg_file);
+        string dir_str = fs::parent_of(cfg_file);
+        string cur_dir = fs::current_path();
+
+        if (cur_dir == "") {
+            mainlog.fatal() << "Failed to get current working directory.\n";
+            return 1;
+        }
+
+        if (dir_str == cur_dir) {
+            // we're already in the directory that the configuration is under.
+            dir_str = "";
+        }
+
+        // change directory
+        if (!dir_str.empty()) {
+            if (!fs::current_path(dir_str)) {
+                mainlog.fatal() << "Could not change working directory to config directory.\n";
+                return 1;
+            }
+        }
+
+        cfg_file = filename;
+    }
+
+    if (!fs::file_exists(cfg_file) || !fs::is_readable(cfg_file)) {
+        mainlog.fatal() << "Config file " << cfg_file << " does not exist or isn't readable.\n";
+        return 1;
+    }
+
+    mainlog.info() << "Loading configuration file...\n";
+
+    ifstream file(cfg_file.c_str());
+    if (!file.is_open()) {
+        mainlog.fatal() << "Failed to open configuration file \"" << cfg_file << "\".\n";
+        return 1;
+    }
+
+    if (!g_config->load(file)) {
+        mainlog.fatal() << "Errors parsing YAML configuration file \"" << cfg_file << "\"!\n";
+        return 1;
+    }
+    file.close();
+
+    if (!ConfigGroup::root().validate(g_config->copy_node())) {
+        mainlog.fatal() << "Configuration file contains errors.\n";
+        return 1;
+    }
+
+    dclass::File* dcf = new dclass::File();
+    dcf->add_keyword("required");
+    dcf->add_keyword("ram");
+    dcf->add_keyword("db");
+    dcf->add_keyword("broadcast");
+    dcf->add_keyword("clrecv");
+    dcf->add_keyword("clsend");
+    dcf->add_keyword("ownsend");
+    dcf->add_keyword("ownrecv");
+    dcf->add_keyword("airecv");
+    vector<string> dc_file_names = dc_files.get_val();
+    for (auto it = dc_file_names.begin(); it != dc_file_names.end(); ++it) {
+        bool ok = dclass::append(dcf, *it);
+        if (!ok) {
+            mainlog.fatal() << "Could not read DC file " << *it << endl;
+            return 1;
+        }
+    }
+    g_dcf = dcf;
+
+    // Now hook up our speciailize signal handler
+    astron_handle_signals();
+
+    try {
+        TaskQueue::singleton.init_queue();
+        // Initialize configured MessageDirector
+        MessageDirector::singleton.init_network();
+        g_eventsender.init(eventlogger_addr.get_val());
+
+        // Load uberdog metadata from configuration
+        ConfigNode udnodes = g_config->copy_node()["uberdogs"];
+        if (!udnodes.IsNull()) {
+            for (auto it = udnodes.begin(); it != udnodes.end(); ++it) {
+                ConfigNode udnode = *it;
+                Uberdog ud;
+
+                // Get the uberdog's class
+                const Class* dcc = g_dcf->get_class_by_name(udnode["class"].as<std::string>());
+                if (!dcc) {
+                    // Make sure it exists
+                    mainlog.fatal() << "For uberdog " << udnode["id"].as<doid_t>()
+                        << " Distributed class " << udnode["class"].as<std::string>()
+                        << " does not exist!" << std::endl;
+                    return 1;
+                }
+
+                // Setup uberdog
+                ud.dcc = dcc;
+                ud.anonymous = udnode["anonymous"].as<bool>();
+                g_uberdogs[udnode["id"].as<doid_t>()] = ud;
+            }
+        }
+
+        // Initialize configured roles
+        ConfigNode node = g_config->copy_node();
+        node = node["roles"];
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            RoleFactory::singleton().instantiate_role((*it)["type"].as<std::string>(), *it);
+        }
+    }
+    // This exception is propogated if astron_shutdown is called
+    catch (const ShutdownException& e) {
+        return e.exit_code();
+    }
+
+    // Run the main event loop
+    int exit_code = 0;
+    try {
+        g_loop->run();
+    }
+
+    // This exception is propogated if astron_shutdown is called
+    catch (const ShutdownException& e) {
+        exit_code = e.exit_code();
+    }
+
+    // Catch any other exception that propogates
+    catch (const exception& e) {
+        mainlog.fatal() << "Uncaught exception from the main event loop: "
+            << e.what() << endl;
+        return 1;
+    }
+
+    return exit_code;
+}
+
+extern "C" void close_astrond(int exit_code) {
+    astron_shutdown(exit_code, false);
+}
+#endif // STATIC_LIB
 
 // printHelp outputs the cli help-text to the given stream.
 void printHelp(ostream &s)
